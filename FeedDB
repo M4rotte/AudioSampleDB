@@ -1,0 +1,125 @@
+#!/bin/bash
+
+# TODO: Store some other values
+
+#set -x
+
+PLACES="/usr/share/games/minetest \
+/usr/share/sounds/alsa"
+
+EXTENSIONS_SEARCHED='(wav|ogg|aiff|au|flac|opus)' 
+FILENAMES_TMPFILE="/tmp/$(basename ${0})-$$-filenames"
+RECORDS_TMPFILE="/tmp/$(basename ${0})-$$-records"
+SQLITE_DB="./$(basename ${0})-$$.sqlite"
+
+function stderr_print() {
+    # $1: message
+    # $2: optional color code (default to white)
+    local color_code=${2:=37}
+    echo -e "\e[${color_code}m${1}\e[m" >&2
+}
+
+function print_info() {
+    # $1: message
+    stderr_print "[INFO]\t${1}" 36
+}
+
+function print_error() {
+    # $1: message
+    stderr_print "[ERROR]\t${1}" 31
+}
+
+function initialization() {
+    # Check for all needed binaries and give up if one is missing
+    for binary in sqlite3 sox file; do
+        test -x "$(which ${binary})" || {
+            print_error "Missing binary: ${binary}. Exiting!"
+            return 3
+        }
+    done
+    local sql_table_creation='CREATE TABLE IF NOT EXISTS samples (filename TEXT PRIMARY KEY, filetype TEXT, length FLOAT)'
+    sqlite3 "${SQLITE_DB}" "${sql_table_creation}"
+}
+
+function clean_and_exit() {
+    # $1: exit code
+    # $2: final message
+    if test -z ${1}; then local exit_code=0; else local exit_code=${1}; fi
+    if test -z "${2}"; then local final_message='An error occured!'; else local final_message="${2}"; fi
+    if test ${exit_code} -eq 0; then 
+        print_info "${final_message}"
+    else
+        print_error "${final_message}"
+    fi
+    rm "${FILENAMES_TMPFILE}" 2>/dev/null
+    rm "${RECORDS_TMPFILE}" 2>/dev/null
+    exit ${exit_code}
+}
+
+function list_samples() {
+    print_info "Searching audio files in ${PLACES} $(sed -e 's/|/,/g' <(echo "${EXTENSIONS_SEARCHED}"))"
+    # The shuf step isn’t needed there, remove for speed up the execution
+    find ${PLACES} -regextype egrep -regex ".*\.${EXTENSIONS_SEARCHED}" | shuf -o "${FILENAMES_TMPFILE}"
+}
+
+function analyze_samples() {
+    print_info "Analyzing samples…" 
+    cat "${FILENAMES_TMPFILE}" | xargs -I% \
+    bash -c "echo -e \"\n\"; file \"%\"; 2>&1 sox \"%\" -n stat stats | grep -vE '^($|Try:)';" > "${RECORDS_TMPFILE}"
+}
+
+function print_samplelist_info() {
+    print_info "$(wc -l "${FILENAMES_TMPFILE}" | cut -d' ' -f1) files to be imported in database \
+(total size: $(cat "${FILENAMES_TMPFILE}" | xargs -d'\n' du -ch | tail -n1  | cut -f1))"
+}
+
+function confirm_processing() {
+    echo "Do you want to proceed? [y/N]"
+    read -sn1 key
+    if [[ "${key}" =~ [yY] ]]; then return 0; else return 1; fi
+}
+
+function insert() {
+    # $1: field
+    # $2: value
+    local sql="REPLACE INTO samples (${1}) VALUES (\"${2}\")"
+    sqlite3 "${SQLITE_DB}" "${sql}"
+}
+
+function update() {
+    # $1: field
+    # $2: value
+    # $3: key
+    local sql="UPDATE samples SET ${1} = \"${2}\" WHERE filename = \"${3}\""
+    sqlite3 "${SQLITE_DB}" "${sql}"
+}
+
+function import_samples() {
+    local iteration=0
+    local record=''
+    print_info "Importing to database…"
+    while read line; do
+        test -z "${line}" && continue
+        if [[ "${line}" =~ ^\/ ]]; then
+            record="${line}"
+            iteration=$(( $iteration + 1))
+            printf "\nRecord #%i:\t%s\n" ${iteration} "${record}"
+            local filename="$(echo "${record}" | cut -d':' -f1)"
+            local filetype="$(echo "${record}" | cut -d':' -f2- | sed -e 's/^ //')"
+            insert 'filename' "${filename}"
+            update 'filetype' "${filetype}" "${filename}"
+        else
+            echo "${line}"
+        fi
+    done < "${RECORDS_TMPFILE}"
+    print_info "${iteration} samples imported to database"
+}
+
+initialization || clean_and_exit ${?} "Process cancelled"
+list_samples
+print_samplelist_info
+confirm_processing || clean_and_exit 0 "Process cancelled by user"
+analyze_samples
+import_samples
+
+clean_and_exit 0 "Process finished. Exiting…"
