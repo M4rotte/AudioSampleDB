@@ -1,125 +1,173 @@
 #!/bin/bash
-
-# TODO: Store some other values
+# RC:
+# 3: Missing binary
+# 4: Cancelled by user
 
 #set -x
 
-PLACES="/usr/share/games/minetest \
-/usr/share/sounds/alsa"
+#~ set -euo pipefail
+IFS=$'\t\n'
 
-EXTENSIONS_SEARCHED='(wav|ogg|aiff|au|flac|opus)' 
-FILENAMES_TMPFILE="/tmp/$(basename ${0})-$$-filenames"
-RECORDS_TMPFILE="/tmp/$(basename ${0})-$$-records"
-SQLITE_DB="./$(basename ${0})-$$.sqlite"
+declare -a ASDB_PLACES=("/usr/share/sounds")
+ASDB_EXTENSIONS_SEARCHED='(wav|ogg|aiff|au|flac|mp3)'
+ASDB_FILENAMES_TMPFILE="/tmp/$(basename ${0})-$$-filenames"
+ASDB_RECORDS_TMPFILE="/tmp/$(basename ${0})-$$-records"
+ASDB_SQLITE_DB="./$(basename ${0})-$$.sqlite"
 
-function stderr_print() {
+tasr () {
+    ## Trim and squeeze repeats, also escape quotes.
+    # 1: string
+    # 2: character (default is space. NB: Not [:space:])
+    tr -s "${2:- }" < <(printf "%s\n" "${1}")
+}
+
+join () {
+    ## Join array values separated by commas single quoteing values
+    # @: array
+    local joined="$(printf ",'%s'" "${@}")"
+    echo "${joined:1}"
+}
+
+stderr_print () {
     # $1: message
     # $2: optional color code (default to white)
     local color_code=${2:=37}
     echo -e "\e[${color_code}m${1}\e[m" >&2
 }
 
-function print_info() {
+print_info () {
     # $1: message
-    stderr_print "[INFO]\t${1}" 36
+    # $2: optional color code (default to blue)
+    stderr_print "[INFO]\t${1}" "${2:-36}"
 }
 
-function print_error() {
+print_error () {
     # $1: message
-    stderr_print "[ERROR]\t${1}" 31
+    # $2: optional color code (default to red)
+    stderr_print "[ERROR]\t${1}" "${2:-31}"
 }
 
-function initialization() {
+initialization () {
     # Check for all needed binaries and give up if one is missing
-    for binary in sqlite3 sox file; do
+    for binary in sqlite3 sox file cksum; do
         test -x "$(which ${binary})" || {
             print_error "Missing binary: ${binary}. Exiting!"
             return 3
         }
     done
-    local sql_table_creation='CREATE TABLE IF NOT EXISTS samples (filename TEXT PRIMARY KEY, filetype TEXT, length FLOAT)'
-    sqlite3 "${SQLITE_DB}" "${sql_table_creation}"
+    # Use the “first” file with a name matching “${0}-[0-9]+\.sqlite” present in the current directory. Create one if none.
+    # NB: If there are multiple candidate files, one is chosen randomly.
+    local db_file="$(find . -regextype egrep -regex ^\./$(basename ${0})-[0-9]+\.sqlite$ -print -quit)"
+    if [[ "${db_file}" ]]; then
+        ASDB_SQLITE_DB="${db_file}"
+        print_info "Using existing database “${ASDB_SQLITE_DB}”."
+    else
+        # Create table from the fields present in the SoX “stat” command output.
+        local query_body="$(while IFS=':' read field default_value; do echo $(echo ${field// /_} \
+        | tr -s '_') REAL DEFAULT ${default_value}; done <<<$(sox -n -n trim 0 1 synth stat 2>&1 | grep -v '^Try:') \
+        | tr '\n' ',' \
+        | tr -d '()' \
+        | head -c -1)"
+        # ID for record is “CRC SIZE” (ie: first two fields of the cksum command output, separated with a space character)
+        local sql_table_creation="CREATE TABLE IF NOT EXISTS samples (id VARCHAR(48) PRIMARY KEY, filename VARCHAR(512), channels INT(2), samplerate REAL, precision INT(2), filesize INT, filetype VARCHAR(8), comment VARCHAR(512), bitrate VARCHAR(32), ${query_body})"
+        sql "${sql_table_creation}" || true
+        print_info "Using newly created database “${ASDB_SQLITE_DB}”."
+    fi
+
+    [[ "${1:-}" ]] && ASDB_PLACES=( "${@}" ) || true
+
 }
 
-function clean_and_exit() {
+clean_and_exit () {
     # $1: exit code
     # $2: final message
-    if test -z ${1}; then local exit_code=0; else local exit_code=${1}; fi
+    if test -z "${1}"; then local exit_code=0; else local exit_code=${1}; fi
     if test -z "${2}"; then local final_message='An error occured!'; else local final_message="${2}"; fi
-    if test ${exit_code} -eq 0; then 
+    if test "${exit_code}" -eq 0; then
         print_info "${final_message}"
+    elif test "${exit_code}" -eq 4; then
+        print_info "${final_message}" 33
     else
         print_error "${final_message}"
     fi
-    rm "${FILENAMES_TMPFILE}" 2>/dev/null
-    rm "${RECORDS_TMPFILE}" 2>/dev/null
-    exit ${exit_code}
+    rm "${ASDB_FILENAMES_TMPFILE}" 2>/dev/null || true
+    rm "${ASDB_RECORDS_TMPFILE}"  2>/dev/null || true
+    exit "${exit_code}"
 }
 
-function list_samples() {
-    print_info "Searching audio files in ${PLACES} $(sed -e 's/|/,/g' <(echo "${EXTENSIONS_SEARCHED}"))"
-    # The shuf step isn’t needed there, remove for speed up the execution
-    find ${PLACES} -regextype egrep -regex ".*\.${EXTENSIONS_SEARCHED}" | shuf -o "${FILENAMES_TMPFILE}"
+list_samples () {
+    print_info "Searching audio files $(sed -e 's/|/,/g' <(echo "${ASDB_EXTENSIONS_SEARCHED}")) in:"
+    for path in "${ASDB_PLACES[@]}"; do
+        print_info "${path}" 38
+    done
+    find "${ASDB_PLACES[@]}" -type f -regextype egrep -regex ".*\.${ASDB_EXTENSIONS_SEARCHED}" > "${ASDB_FILENAMES_TMPFILE}" || true
 }
 
-function analyze_samples() {
-    print_info "Analyzing samples…" 
-    cat "${FILENAMES_TMPFILE}" | xargs -I% \
-    bash -c "echo -e \"\n\"; file \"%\"; 2>&1 sox \"%\" -n stat stats | grep -vE '^($|Try:)';" > "${RECORDS_TMPFILE}"
+sample_info () {
+    #1: filename
+    declare -Ag infos=()
+    printf "%s\033[0K\r" "${1}" >&2
+    while IFS=':' read f v; do
+        local field="$(tr ' ' '_' < <(tasr "${f//[)(]/}"))"
+        local value="$(printf "%s\n" "$(tasr "${v##* }")")"
+        #~ echo "Field: ${field}" >&2
+        infos["${field}"]="${value}" || true
+    done <<<$(sox "${1}" -n stat 2>&1 | grep -E '[a-zA-Z_)( ]+:[0-9. -]+' | grep -Ev '^(input clipped|sox WARN |sox FAIL |Try:)' | true)
 }
 
-function print_samplelist_info() {
-    print_info "$(wc -l "${FILENAMES_TMPFILE}" | cut -d' ' -f1) files to be imported in database \
-(total size: $(cat "${FILENAMES_TMPFILE}" | xargs -d'\n' du -ch | tail -n1  | cut -f1))"
+import_samples () {
+    declare -i  nb_of_samples=0
+    declare -Ag sample_values=()
+    declare -i start_time="${EPOCHSECONDS}"
+    print_info "Importing samples…"
+    while IFS='\n' read filename; do
+        sample_values[filename]="${filename}"
+        sample_values[id]="$(cut -d' ' -f-2 < <(cksum "${filename}"))"
+        sample_values[channels]="$(soxi -V0 -c "${filename}")"
+        sample_values[samplerate]="$(soxi -V0 -r "${filename}")"
+        sample_values[precision]="$(soxi -V0 -p "${filename}")"
+        sample_values[filesize]="$(soxi -V0 -s "${filename}")"
+        sample_values[filetype]="$(soxi -V0 -t "${filename}")"
+        sample_values[bitrate]="$(soxi -V0 -B "${filename}")"
+        sample_values[comment]="$(soxi -V0 -a "${filename}")"
+        sample_info "${filename}"
+        for k in "${!infos[@]}"; do
+            sample_values["${k}"]="${infos[$k]}"
+        done
+        local query='REPLACE INTO samples'
+        local -a columns=()
+        local -a values=()
+        for k in "${!sample_values[@]}"; do
+            columns+=("${k}")
+            values+=("${sample_values[$k]}")
+        done
+        query+=" ($(join "${columns[@]}")) VALUES ($(join "${values[@]}"));"
+        sql "$query" || true
+        let nb_of_samples++ || true
+    done < "${ASDB_FILENAMES_TMPFILE}"
+    print_info "${nb_of_samples} files processed in $((EPOCHSECONDS-start_time)) seconds."
 }
 
-function confirm_processing() {
+samplelist_info () {
+    print_info "$(wc -l "${ASDB_FILENAMES_TMPFILE}" | cut -d' ' -f1) files to import in database \
+(total size: $(cat "${ASDB_FILENAMES_TMPFILE}" | xargs -d'\n' du -ch | tail -n1  | cut -f1))."
+}
+
+confirm_processing () {
     echo "Do you want to proceed? [y/N]"
     read -sn1 key
-    if [[ "${key}" =~ [yY] ]]; then return 0; else return 1; fi
+    [[ "${key}" =~ [yY] ]] || return 1
 }
 
-function insert() {
-    # $1: field
-    # $2: value
-    local sql="REPLACE INTO samples (${1}) VALUES (\"${2}\")"
-    sqlite3 "${SQLITE_DB}" "${sql}"
+sql () {
+    #1: SQL query
+    sqlite3 -batch "${ASDB_SQLITE_DB}" "${1:-}" || true
 }
 
-function update() {
-    # $1: field
-    # $2: value
-    # $3: key
-    local sql="UPDATE samples SET ${1} = \"${2}\" WHERE filename = \"${3}\""
-    sqlite3 "${SQLITE_DB}" "${sql}"
-}
 
-function import_samples() {
-    local iteration=0
-    local record=''
-    print_info "Importing to database…"
-    while read line; do
-        test -z "${line}" && continue
-        if [[ "${line}" =~ ^\/ ]]; then
-            record="${line}"
-            iteration=$(( $iteration + 1))
-            printf "\nRecord #%i:\t%s\n" ${iteration} "${record}"
-            local filename="$(echo "${record}" | cut -d':' -f1)"
-            local filetype="$(echo "${record}" | cut -d':' -f2- | sed -e 's/^ //')"
-            insert 'filename' "${filename}"
-            update 'filetype' "${filetype}" "${filename}"
-        else
-            echo "${line}"
-        fi
-    done < "${RECORDS_TMPFILE}"
-    print_info "${iteration} samples imported to database"
-}
-
-initialization || clean_and_exit ${?} "Process cancelled"
+initialization "${@}" || clean_and_exit ${?} "Process cancelled."
 list_samples
-print_samplelist_info
-confirm_processing || clean_and_exit 0 "Process cancelled by user"
-analyze_samples
+samplelist_info
+confirm_processing || clean_and_exit 4 "Process cancelled by user."
 import_samples
-
 clean_and_exit 0 "Process finished. Exiting…"

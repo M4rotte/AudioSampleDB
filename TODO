@@ -1,0 +1,8 @@
+AudioSampleDB TODO
+
+# FeedDB
+ - Store some other values
+ - Use [[ instead of test
+ - Use case in the clean_and_exit function
+ - Let the user specifies a database with a command line option
+
